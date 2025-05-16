@@ -1,11 +1,18 @@
+__version__ = "1.9.0"
+__build_date__ = "2025-05-13"
+
 import sys
 import psutil
 import ctypes
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QListWidget, QTabWidget, QPushButton, QLabel, QMenu, 
-                             QSplitter, QCheckBox, QTextEdit, QScrollArea, QMessageBox, QListWidgetItem)
-from PyQt5.QtCore import Qt, QTimer
+                             QSplitter, QCheckBox, QTextEdit, QScrollArea, QMessageBox, QListWidgetItem,QComboBox)
+from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+from PyQt5.QtCore import Qt, QTimer, QCoreApplication
 from PyQt5.QtGui import QFont, QTextCursor, QColor
+from pypinyin import lazy_pinyin
+from PyQt5.QtGui import QIcon
+QCoreApplication.setApplicationVersion(__version__)
 
 # Windows API常量
 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -13,12 +20,35 @@ PROCESS_ALL_ACCESS = 0x1F0FFF
 class ProcessManager(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("进程管理工具 v1.1.0")
+        self.setWindowTitle(f"进程管理工具 v{__version__} (Build {__build_date__})")
         self.resize(500, 700)
+
+        # 设置程序图标
+        self.setWindowIcon(QIcon('icon.ico'))
+
+        # 添加全局样式表
+        self.setStyleSheet("""
+            QWidget {
+                font-size: 9pt;
+            }
+            QTextEdit, QComboBox {
+                border: 1px solid #ccc;
+                border-radius: 3px;
+            }
+        """)
         
         # 初始化隐藏进程字典
         self.hidden_processes = {}  # 先初始化这个属性
-        
+
+        # 排序控制变量
+        self.current_sort_column = 0  # 当前排序列
+        self.sort_order = Qt.AscendingOrder  # 当前排序顺序
+        self.sort_methods = {
+            0: self.sort_by_pid,      # PID列
+            1: self.sort_by_name,     # 进程列
+            2: self.sort_by_title     # 窗口标题列
+        }
+
         # 主窗口布局
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
@@ -37,13 +67,52 @@ class ProcessManager(QMainWindow):
         self.toggle_button.clicked.connect(self.toggle_control_panel)
         self.top_layout.addWidget(self.toggle_button)
         
-        # 进程列表
-        self.process_list = QListWidget()
+        # 添加搜索框
+        self.search_container = QWidget()
+        self.search_layout = QHBoxLayout(self.search_container)
+        self.search_layout.setContentsMargins(0, 0, 0, 0)  # 设置布局边距为0
+        self.search_layout.setSpacing(5)  # 设置控件间距为5像素
+        self.search_input = QTextEdit()
+        self.search_input.setMaximumHeight(28)  # 稍微降低高度
+        self.search_input.setPlaceholderText("输入进程名/窗口标题/拼音首字母搜索...")
+        self.search_input.textChanged.connect(self.filter_process_list)
+        self.search_input.setStyleSheet("QTextEdit { padding: 1px; }")  # 减少内边距
+        self.search_layout.addWidget(self.search_input)
+        # 添加搜索选项
+        self.search_options = QComboBox()
+        self.search_options.setMaximumHeight(28)  # 设置与输入框相同高度
+        self.search_options.addItems(["模糊搜索", "精确匹配"])
+        self.search_options.currentIndexChanged.connect(self.filter_process_list)
+        self.search_layout.addWidget(self.search_options)
+        # 设置搜索容器的最小高度
+        self.search_container.setMaximumHeight(30)
+        self.top_layout.addWidget(self.search_container)
+        self.top_layout.setSpacing(5)  # 设置顶部布局的控件间距
+
+        # 进程列表 - 改为表格形式
+        self.process_list = QTableWidget()
         self.process_list.setFont(QFont("Microsoft YaHei", 10))
+        self.process_list.setColumnCount(3)
+        self.process_list.setHorizontalHeaderLabels(["PID", "进程名", "窗口标题"])
+        self.process_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.process_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.process_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.process_list.setSelectionBehavior(QTableWidget.SelectRows)
         self.process_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.process_list.customContextMenuRequested.connect(self.show_context_menu)
         self.process_list.itemClicked.connect(self.show_process_details)
-        self.top_layout.addWidget(self.process_list)
+        self.process_list.setSortingEnabled(True)  # 启用排序
+
+        self.process_list.horizontalHeader().sectionClicked.connect(self.on_header_clicked) 
+
+        # 设置表头样式
+        header = self.process_list.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(0, Qt.AscendingOrder)  # 默认按PID升序
+        self.top_layout.addWidget(self.process_list)  # 最后添加到布局
+
+
         
         # 下部区域 - 控制面板
         self.bottom_widget = QWidget()
@@ -171,10 +240,8 @@ class ProcessManager(QMainWindow):
     
     def update_process_list(self):
         """更新进程列表"""
-        current_item = self.process_list.currentItem()
-        selected_pid = current_item.data(Qt.UserRole) if current_item else None
-        
-        self.process_list.clear()
+        self.process_list.setSortingEnabled(False)  # 临时禁用排序
+        self.process_list.setRowCount(0)  # 清空表格
         
         show_hidden = self.show_hidden_checkbox.isChecked()
         
@@ -191,29 +258,49 @@ class ProcessManager(QMainWindow):
                 
                 # 获取窗口标题
                 window_titles = self.get_window_titles(pid)
-                title_info = f" - 窗口: {', '.join(window_titles)}" if window_titles else ""
+                title_info = ', '.join(window_titles) if window_titles else ""
                 
-                item_text = f"{proc.info['name']} (PID: {pid}){title_info}"
+                # 添加行
+                row = self.process_list.rowCount()
+                self.process_list.insertRow(row)
+                
+                # PID列
+                pid_item = QTableWidgetItem(str(pid))
+                pid_item.setData(Qt.UserRole, pid)
                 if is_hidden:
-                    item_text = "[隐藏] " + item_text
+                    pid_item.setForeground(QColor(255, 0, 0))
+                self.process_list.setItem(row, 0, pid_item)
                 
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.UserRole, pid)
-                
-                # 如果是隐藏进程，设置特殊颜色
+                # 进程名列
+                name_item = QTableWidgetItem(proc.info['name'])
                 if is_hidden:
-                    item.setForeground(QColor(255, 0, 0))  # 红色
+                    name_item.setText("[隐藏] " + proc.info['name'])
+                    name_item.setForeground(QColor(255, 0, 0))
+                self.process_list.setItem(row, 1, name_item)
                 
-                self.process_list.addItem(item)
+                # 窗口标题列
+                title_item = QTableWidgetItem(title_info)
+                if is_hidden:
+                    title_item.setForeground(QColor(255, 0, 0))
+                self.process_list.setItem(row, 2, title_item)
                 
-                # 恢复之前选中的进程
-                if selected_pid and pid == selected_pid:
-                    self.process_list.setCurrentItem(item)
-            
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         
+        self.process_list.setSortingEnabled(True)  # 重新启用排序
         self.log("进程列表已更新")
+
+        # 如果有搜索文本，应用过滤
+        if self.search_input.toPlainText().strip():
+            self.filter_process_list()
+
+
+        # 恢复之前的排序状态
+        if hasattr(self, 'current_sort_column'):
+            sort_method = self.sort_methods.get(self.current_sort_column, self.sort_by_pid)
+            sort_method(self.sort_order)
+            self.process_list.horizontalHeader().setSortIndicator(self.current_sort_column, self.sort_order)
+
     
     def show_context_menu(self, position):
         """显示右键菜单"""
@@ -221,15 +308,25 @@ class ProcessManager(QMainWindow):
         if not item:
             return
         
-        menu = QMenu()
-        
-        pid = item.data(Qt.UserRole)
-        proc_name = item.text().split(" (PID:")[0].replace("[隐藏] ", "")
+        row = item.row()
+        pid_item = self.process_list.item(row, 0)
+        pid = pid_item.data(Qt.UserRole)
+        proc_name_item = self.process_list.item(row, 1)
+        proc_name = proc_name_item.text().replace("[隐藏] ", "")
         
         # 检查进程是否已隐藏
         is_hidden = pid in self.hidden_processes and self.hidden_processes[pid]
         
-        # 添加菜单项
+        # 创建菜单
+        menu = QMenu()
+        
+        # 添加排序菜单项
+        sort_menu = menu.addMenu("排序方式")
+        sort_menu.addAction("按PID排序", lambda: self.on_header_clicked(0))
+        sort_menu.addAction("按进程名排序", lambda: self.on_header_clicked(1))
+        sort_menu.addAction("按窗口标题排序", lambda: self.on_header_clicked(2))
+        
+        # 添加进程操作菜单项
         show_hide_action = menu.addAction("隐藏进程" if not is_hidden else "显示进程")
         kill_action = menu.addAction(f"结束进程: {proc_name}")
         suspend_action = menu.addAction("挂起进程")
@@ -407,6 +504,96 @@ class ProcessManager(QMainWindow):
         """清空日志"""
         self.log_text.clear()
         self.log("日志已清空")
+
+
+    def get_pinyin_initials(self, text):
+        """获取文本的拼音首字母"""
+        if not text or not isinstance(text, str):
+            return ""
+        initials = [p[0].upper() for p in lazy_pinyin(text) if p]
+        return "".join(initials)
+
+    
+
+    def filter_process_list(self):
+        """根据搜索条件过滤进程列表"""
+        search_text = self.search_input.toPlainText().strip().lower()
+        if not search_text:
+            for i in range(self.process_list.rowCount()):
+                self.process_list.setRowHidden(i, False)
+            return
+        
+        exact_match = self.search_options.currentIndex() == 1
+        
+        for i in range(self.process_list.rowCount()):
+            pid_item = self.process_list.item(i, 0)
+            name_item = self.process_list.item(i, 1)
+            title_item = self.process_list.item(i, 2)
+            
+            pid = pid_item.data(Qt.UserRole)
+            process_name = name_item.text().replace("[隐藏] ", "").lower()
+            window_titles = title_item.text().lower()
+            
+            # 获取拼音首字母
+            pinyin_initials = self.get_pinyin_initials(process_name)
+            
+            # 检查匹配条件
+            match_found = False
+            if exact_match:
+                match_found = (search_text == process_name or 
+                            search_text == window_titles)
+            else:
+                # 模糊匹配：进程名、窗口标题或拼音首字母
+                match_found = (search_text in process_name or 
+                            search_text in window_titles or
+                            search_text in pinyin_initials.lower())
+            
+            self.process_list.setRowHidden(i, not match_found)
+
+
+    def sort_table(self, logicalIndex):
+        """表格排序方法"""
+        self.process_list.sortItems(logicalIndex)
+
+    def sort_by_pid(self, order):
+        """按PID排序"""
+        self.process_list.sortItems(0, order)
+        
+    def sort_by_name(self, order):
+        """按进程名排序(智能排序，考虑隐藏标记)"""
+        for row in range(self.process_list.rowCount()):
+            item = self.process_list.item(row, 1)
+            # 移除隐藏标记后再比较
+            text = item.text().replace("[隐藏] ", "")
+            item.setData(Qt.UserRole + 1, text.lower())
+        self.process_list.sortItems(1, order)
+
+    def sort_by_title(self, order):
+        """按窗口标题排序(智能排序)"""
+        for row in range(self.process_list.rowCount()):
+            item = self.process_list.item(row, 2)
+            # 处理空标题情况
+            text = item.text() if item.text() else ""
+            item.setData(Qt.UserRole + 1, text.lower())
+        self.process_list.sortItems(2, order)
+
+
+    def on_header_clicked(self, logicalIndex):
+        """表头点击事件处理"""
+        if logicalIndex == self.current_sort_column:
+            # 同一列点击，切换排序顺序
+            self.sort_order = Qt.DescendingOrder if self.sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        else:
+            # 不同列点击，重置为升序
+            self.current_sort_column = logicalIndex
+            self.sort_order = Qt.AscendingOrder
+        
+        # 执行排序
+        sort_method = self.sort_methods.get(logicalIndex, self.sort_by_pid)
+        sort_method(self.sort_order)
+        
+        # 更新表头指示器
+        self.process_list.horizontalHeader().setSortIndicator(logicalIndex, self.sort_order)
 
 
 if __name__ == "__main__":
